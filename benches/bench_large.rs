@@ -22,61 +22,56 @@ fn generate_sparse_matrix(
     tri.to_csr()
 }
 
-fn bench_config(n: usize, p: usize, density: f64, n_pred: usize, n_orth: usize) {
-    let m = 1;
+fn bench_config(n: usize, p: usize, m: usize, density: f64, n_pred: usize, n_orth: usize) {
     let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-    println!("  Matrix: {n} x {p}, density={density}");
+    eprint!("  Generating matrix... ");
     let x = generate_sparse_matrix(&mut rng, n, p, density);
-    println!("  nnz = {} ({:.1}M)", x.nnz(), x.nnz() as f64 / 1e6);
+    eprintln!("done ({:.1}M nnz)", x.nnz() as f64 / 1e6);
+    println!("  Matrix: {n} x {p}, m={m}, density={density}, nnz={:.1}M", x.nnz() as f64 / 1e6);
 
     let y_data: Vec<f64> = (0..n * m).map(|_| rng.random::<f64>() * 10.0).collect();
     let y = Array2::from_shape_vec((n, m), y_data).unwrap();
 
-    // Run 3 times, take best
     let mut best_fit = f64::MAX;
     let mut best_predict = f64::MAX;
     for run in 0..3 {
+        eprint!("  Run {}/3: fit... ", run + 1);
         let start = Instant::now();
         let model = OplsModel::fit(&x, &y, n_pred, n_orth);
         let fit_time = start.elapsed().as_secs_f64();
         best_fit = best_fit.min(fit_time);
+        eprint!("{fit_time:.1}s, predict... ");
 
         let start = Instant::now();
         let _y_hat = model.predict(&x);
         let predict_time = start.elapsed().as_secs_f64();
         best_predict = best_predict.min(predict_time);
+        eprintln!("{predict_time:.1}s");
 
         if run == 0 {
-            // Print dispersion stats on first run
             let d = &model.dispersions;
             let d_slice = d.as_slice().unwrap();
             let mean_d: f64 = d_slice.iter().sum::<f64>() / d_slice.len() as f64;
-            let min_d = d_slice.iter().cloned().fold(f64::MAX, f64::min);
-            let max_d = d_slice.iter().cloned().fold(f64::MIN, f64::max);
-            println!("  dispersions: mean={mean_d:.4}, min={min_d:.6}, max={max_d:.4}");
+            println!("  dispersions: mean={mean_d:.4}");
         }
     }
-    println!("  fit:     {best_fit:.3}s");
-    println!("  predict: {best_predict:.3}s");
+    println!("  best fit:     {best_fit:.3}s");
+    println!("  best predict: {best_predict:.3}s");
 }
 
 fn main() {
-    println!("Benchmark: sparse OPLS with DESeq2-style VST");
+    println!("Benchmark: sparse OPLS with DESeq2-style VST (m=5)");
 
     println!();
     println!("--- 10k samples x 20k features, 1% density ---");
-    bench_config(10_000, 20_000, 0.01, 2, 2);
+    bench_config(10_000, 20_000, 5, 0.01, 2, 2);
 
     println!();
     println!("--- 10k samples x 20k features, 5% density ---");
-    bench_config(10_000, 20_000, 0.05, 2, 2);
+    bench_config(10_000, 20_000, 5, 0.05, 2, 2);
 
     println!();
     println!("--- 50k samples x 20k features, 1% density ---");
-    bench_config(50_000, 20_000, 0.01, 2, 2);
-
-    println!();
-    println!("--- 200k samples x 20k features, 5% density ---");
-    bench_config(200_000, 20_000, 0.05, 2, 2);
+    bench_config(50_000, 20_000, 5, 0.01, 2, 2);
 }
