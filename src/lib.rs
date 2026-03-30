@@ -1,6 +1,9 @@
 use ndarray::{Array1, Array2, Axis, s};
 use sprs::CsMatI;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Fitted OPLS model containing all components needed for prediction.
 pub struct OplsModel {
     /// Column means of X after row-normalization and pseudolog (p,)
@@ -21,44 +24,183 @@ pub struct OplsModel {
     pub coefficients: Array2<f64>,
 }
 
-// ── Preprocessing ──────────────────────────────────────────────────────────
+// ── Implicit sparse X representation ───────────────────────────────────────
+//
+// X_eff = X_sparse_pl - 1·μ^T - T_defl · P_defl^T
+//
+// All matrix-vector products go through this representation so the n×p dense
+// matrix is never materialized.
 
-/// Row-normalize sparse X (divide each row by its sum), apply pseudolog, return dense.
-fn preprocess_x(x: &CsMatI<f64, usize>, n: usize, p: usize) -> Array2<f64> {
-    let mut dense = Array2::<f64>::zeros((n, p));
-    // Compute row sums
+/// Row-normalize sparse X and apply pseudolog. Sparsity preserved since log(0+1)=0.
+fn sparse_row_normalize_pseudolog(x: &CsMatI<f64, usize>) -> sprs::CsMat<f64> {
+    let n = x.rows();
+    let p = x.cols();
     let mut row_sums = vec![0.0_f64; n];
-    for (&val, (r, _c)) in x.iter() {
+    for (&val, (r, _)) in x.iter() {
         row_sums[r] += val;
     }
-    // Normalize and pseudolog
+    let mut tri = sprs::TriMat::new((n, p));
     for (&val, (r, c)) in x.iter() {
         let rs = row_sums[r];
         if rs > 0.0 {
-            dense[[r, c]] = (val / rs + 1.0).ln();
+            let v = (val / rs + 1.0).ln();
+            if v != 0.0 {
+                tri.add_triplet(r, c, v);
+            }
         }
     }
-    dense
+    tri.to_csr()
 }
 
-/// Center columns in-place, return the column means.
-fn center_columns(mat: &mut Array2<f64>) -> Array1<f64> {
-    let means = mat.mean_axis(Axis(0)).unwrap();
-    for mut row in mat.rows_mut() {
-        row -= &means;
+fn sparse_col_means(x: &sprs::CsMat<f64>, n: usize) -> Array1<f64> {
+    let p = x.cols();
+    let mut sums = Array1::<f64>::zeros(p);
+    for (&val, (_, c)) in x.iter() {
+        sums[c] += val;
     }
-    means
+    sums / n as f64
+}
+
+// ── Sparse mat-vec: serial implementations ─────────────────────────────────
+
+/// X_sp * v (CSR forward multiply, serial): result[row] = Σ_j X[row,j] * v[j]
+#[cfg(not(feature = "parallel"))]
+fn spmv_forward_serial(
+    indptr: &[usize],
+    indices: &[usize],
+    data: &[f64],
+    v: &[f64],
+    n: usize,
+) -> Vec<f64> {
+    let mut result = vec![0.0_f64; n];
+    for row in 0..n {
+        let start = indptr[row];
+        let end = indptr[row + 1];
+        let mut sum = 0.0;
+        for idx in start..end {
+            sum += data[idx] * v[indices[idx]];
+        }
+        result[row] = sum;
+    }
+    result
+}
+
+/// X_sp^T * v (CSR transpose multiply, serial): result[col] = Σ_i X[i,col] * v[i]
+fn spmv_transpose_serial(
+    indptr: &[usize],
+    indices: &[usize],
+    data: &[f64],
+    v: &[f64],
+    p: usize,
+) -> Vec<f64> {
+    let n = indptr.len() - 1;
+    let mut result = vec![0.0_f64; p];
+    for row in 0..n {
+        let start = indptr[row];
+        let end = indptr[row + 1];
+        let vi = v[row];
+        for idx in start..end {
+            result[indices[idx]] += data[idx] * vi;
+        }
+    }
+    result
+}
+
+// ── Sparse mat-vec: parallel implementations ───────────────────────────────
+
+#[cfg(feature = "parallel")]
+fn spmv_forward_parallel(
+    indptr: &[usize],
+    indices: &[usize],
+    data: &[f64],
+    v: &[f64],
+    n: usize,
+) -> Vec<f64> {
+    (0..n)
+        .into_par_iter()
+        .map(|row| {
+            let start = indptr[row];
+            let end = indptr[row + 1];
+            let mut sum = 0.0;
+            for idx in start..end {
+                sum += data[idx] * v[indices[idx]];
+            }
+            sum
+        })
+        .collect()
+}
+
+// ── Unified dispatch ───────────────────────────────────────────────────────
+
+fn spmv_forward(x_sp: &sprs::CsMat<f64>, v: &Array1<f64>, n: usize) -> Array1<f64> {
+    let indptr_raw = x_sp.indptr();
+    let indptr = indptr_raw.as_slice().expect("non-contiguous indptr");
+    let indices = x_sp.indices();
+    let data = x_sp.data();
+    let v_slice = v.as_slice().expect("non-contiguous v");
+
+    #[cfg(feature = "parallel")]
+    let result = spmv_forward_parallel(indptr, indices, data, v_slice, n);
+    #[cfg(not(feature = "parallel"))]
+    let result = spmv_forward_serial(indptr, indices, data, v_slice, n);
+
+    Array1::from_vec(result)
+}
+
+fn spmv_transpose(x_sp: &sprs::CsMat<f64>, v: &Array1<f64>, p: usize) -> Array1<f64> {
+    // Transpose multiply is scatter-based (accumulate into result[col]).
+    // Parallelizing with per-chunk buffers adds allocation overhead that
+    // outweighs the gain for typical sizes. Keep serial.
+    let indptr_raw = x_sp.indptr();
+    let indptr = indptr_raw.as_slice().expect("non-contiguous indptr");
+    let indices = x_sp.indices();
+    let data = x_sp.data();
+    let v_slice = v.as_slice().expect("non-contiguous v");
+    let result = spmv_transpose_serial(indptr, indices, data, v_slice, p);
+    Array1::from_vec(result)
+}
+
+// ── Implicit X_eff operations ──────────────────────────────────────────────
+
+/// X_eff * v = X_sp * v - (μ·v)·1_n - Σ (p_k·v) * t_k
+fn xeff_mul_vec(
+    x_sp: &sprs::CsMat<f64>,
+    mu: &Array1<f64>,
+    t_defl: &[Array1<f64>],
+    p_defl: &[Array1<f64>],
+    v: &Array1<f64>,
+    n: usize,
+) -> Array1<f64> {
+    let mut result = spmv_forward(x_sp, v, n);
+    let mu_dot_v = mu.dot(v);
+    result -= mu_dot_v;
+    for (t_k, p_k) in t_defl.iter().zip(p_defl.iter()) {
+        let coeff = p_k.dot(v);
+        result.scaled_add(-coeff, t_k);
+    }
+    result
+}
+
+/// X_eff^T * v = X_sp^T * v - μ*sum(v) - Σ (t_k·v) * p_k
+fn xeff_tmul_vec(
+    x_sp: &sprs::CsMat<f64>,
+    mu: &Array1<f64>,
+    t_defl: &[Array1<f64>],
+    p_defl: &[Array1<f64>],
+    v: &Array1<f64>,
+    p: usize,
+) -> Array1<f64> {
+    let mut result = spmv_transpose(x_sp, v, p);
+    let sum_v = v.sum();
+    result.scaled_add(-sum_v, mu);
+    for (t_k, p_k) in t_defl.iter().zip(p_defl.iter()) {
+        let coeff = t_k.dot(v);
+        result.scaled_add(-coeff, p_k);
+    }
+    result
 }
 
 // ── Linear algebra helpers ─────────────────────────────────────────────────
-
-fn dot_mv(a: &Array2<f64>, v: &Array1<f64>) -> Array1<f64> {
-    a.dot(v)
-}
-
-fn dot_mtv(a: &Array2<f64>, v: &Array1<f64>) -> Array1<f64> {
-    a.t().dot(v)
-}
 
 fn norm(v: &Array1<f64>) -> f64 {
     v.dot(v).sqrt()
@@ -71,22 +213,19 @@ fn normalize(v: &mut Array1<f64>) {
     }
 }
 
-/// Solve B = W (P^T W)^{-1} C^T  for small square (P^T W).
 fn solve_coefficients(
     w: &Array2<f64>,
     p: &Array2<f64>,
     c: &Array2<f64>,
 ) -> Array2<f64> {
-    let ptw = p.t().dot(w); // (A x A)
+    let ptw = p.t().dot(w);
     let a = ptw.nrows();
-    // Invert P^T W via Gauss-Jordan
     let mut aug = Array2::<f64>::zeros((a, 2 * a));
     aug.slice_mut(s![.., ..a]).assign(&ptw);
     for i in 0..a {
         aug[[i, a + i]] = 1.0;
     }
     for col in 0..a {
-        // Partial pivot
         let mut max_row = col;
         let mut max_val = aug[[col, col]].abs();
         for row in (col + 1)..a {
@@ -121,56 +260,70 @@ fn solve_coefficients(
     w.dot(&inv_ptw).dot(&c.t())
 }
 
-// ── NIPALS PLS weight computation ──────────────────────────────────────────
+fn center_columns(mat: &mut Array2<f64>) -> Array1<f64> {
+    let means = mat.mean_axis(Axis(0)).unwrap();
+    for mut row in mat.rows_mut() {
+        row -= &means;
+    }
+    means
+}
 
-/// Compute PLS weight vector w for single-Y case.
-fn pls_weight_single(x: &Array2<f64>, y: &Array1<f64>) -> Array1<f64> {
-    let mut w = dot_mtv(x, y);
+// ── NIPALS PLS weight computation (using implicit X) ───────────────────────
+
+fn pls_weight_single(
+    x_sp: &sprs::CsMat<f64>,
+    mu: &Array1<f64>,
+    t_defl: &[Array1<f64>],
+    p_defl: &[Array1<f64>],
+    y: &Array1<f64>,
+    p: usize,
+) -> Array1<f64> {
+    let mut w = xeff_tmul_vec(x_sp, mu, t_defl, p_defl, y, p);
     normalize(&mut w);
     w
 }
 
-/// Compute PLS weight vector w and Y-loading c for multi-Y case via NIPALS.
-fn pls_weight_multi(x: &Array2<f64>, y: &Array2<f64>, max_iter: usize, tol: f64) -> (Array1<f64>, Array1<f64>) {
+fn pls_weight_multi(
+    x_sp: &sprs::CsMat<f64>,
+    mu: &Array1<f64>,
+    t_defl: &[Array1<f64>],
+    p_defl: &[Array1<f64>],
+    y: &Array2<f64>,
+    n: usize,
+    p: usize,
+    max_iter: usize,
+    tol: f64,
+) -> (Array1<f64>, Array1<f64>) {
     let mut u = y.column(0).to_owned();
-    let mut w;
-    let mut t;
-    let mut c;
     for _ in 0..max_iter {
-        w = dot_mtv(x, &u);
+        let mut w = xeff_tmul_vec(x_sp, mu, t_defl, p_defl, &u, p);
         normalize(&mut w);
-        t = dot_mv(x, &w);
+        let t = xeff_mul_vec(x_sp, mu, t_defl, p_defl, &w, n);
         let tt = t.dot(&t);
-        c = y.t().dot(&t) / tt;
+        let c = y.t().dot(&t) / tt;
         let u_new = y.dot(&c) / c.dot(&c);
         let diff = norm(&(&u_new - &u));
         u = u_new;
         if diff < tol {
-            w = dot_mtv(x, &u);
+            let mut w = xeff_tmul_vec(x_sp, mu, t_defl, p_defl, &u, p);
             normalize(&mut w);
-            t = dot_mv(x, &w);
+            let t = xeff_mul_vec(x_sp, mu, t_defl, p_defl, &w, n);
             let tt2 = t.dot(&t);
-            c = y.t().dot(&t) / tt2;
+            let c = y.t().dot(&t) / tt2;
             return (w, c);
         }
     }
-    w = dot_mtv(x, &u);
+    let mut w = xeff_tmul_vec(x_sp, mu, t_defl, p_defl, &u, p);
     normalize(&mut w);
-    t = dot_mv(x, &w);
+    let t = xeff_mul_vec(x_sp, mu, t_defl, p_defl, &w, n);
     let tt = t.dot(&t);
-    c = y.t().dot(&t) / tt;
+    let c = y.t().dot(&t) / tt;
     (w, c)
 }
 
 // ── OPLS fitting ───────────────────────────────────────────────────────────
 
 impl OplsModel {
-    /// Fit an OPLS model.
-    ///
-    /// - `x`: sparse CSR matrix (n x p) of raw counts
-    /// - `y`: dense matrix (n x m) of responses
-    /// - `n_predictive`: number of predictive components
-    /// - `n_orthogonal`: number of orthogonal components to remove
     pub fn fit(
         x: &CsMatI<f64, usize>,
         y: &Array2<f64>,
@@ -181,95 +334,87 @@ impl OplsModel {
         let p = x.cols();
         let m = y.ncols();
 
-        // Preprocess X: row normalize, pseudolog, center
-        let mut xd = preprocess_x(x, n, p);
-        let x_mean = center_columns(&mut xd);
+        let x_sp = sparse_row_normalize_pseudolog(x);
+        let x_mean = sparse_col_means(&x_sp, n);
 
-        // Center Y
         let mut yd = y.clone();
         let y_mean = center_columns(&mut yd);
 
-        // --- Orthogonal component extraction ---
+        let mut t_defl: Vec<Array1<f64>> = Vec::new();
+        let mut p_defl: Vec<Array1<f64>> = Vec::new();
+
         let mut weights_orth = Array2::<f64>::zeros((p, n_orthogonal));
         let mut loadings_orth = Array2::<f64>::zeros((p, n_orthogonal));
 
         if n_orthogonal > 0 {
-            // Compute initial PLS weight
             let w = if m == 1 {
-                pls_weight_single(&xd, &yd.column(0).to_owned())
+                pls_weight_single(&x_sp, &x_mean, &t_defl, &p_defl, &yd.column(0).to_owned(), p)
             } else {
-                pls_weight_multi(&xd, &yd, 500, 1e-10).0
+                pls_weight_multi(&x_sp, &x_mean, &t_defl, &p_defl, &yd, n, p, 500, 1e-10).0
             };
 
-            let mut t = dot_mv(&xd, &w);
-            let mut p_loading = dot_mtv(&xd, &t) / t.dot(&t);
+            let mut t = xeff_mul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &w, n);
+            let mut p_loading = xeff_tmul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &t, p) / t.dot(&t);
 
             for a in 0..n_orthogonal {
-                // Orthogonal weight: component of p orthogonal to w
                 let mut w_orth = &p_loading - &(&w * (w.dot(&p_loading) / w.dot(&w)));
                 normalize(&mut w_orth);
 
-                // Orthogonal score and loading
-                let t_orth = dot_mv(&xd, &w_orth);
+                let t_orth = xeff_mul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &w_orth, n);
                 let tt_orth = t_orth.dot(&t_orth);
-                let p_orth = dot_mtv(&xd, &t_orth) / tt_orth;
+                let p_orth = xeff_tmul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &t_orth, p) / tt_orth;
 
-                // Deflate X
-                for i in 0..n {
-                    for j in 0..p {
-                        xd[[i, j]] -= t_orth[i] * p_orth[j];
-                    }
-                }
+                t_defl.push(t_orth);
+                p_defl.push(p_orth.clone());
 
-                // Store
                 weights_orth.column_mut(a).assign(&w_orth);
                 loadings_orth.column_mut(a).assign(&p_orth);
 
-                // Recompute predictive score and loading on deflated X
-                t = dot_mv(&xd, &w);
-                p_loading = dot_mtv(&xd, &t) / t.dot(&t);
+                t = xeff_mul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &w, n);
+                p_loading = xeff_tmul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &t, p) / t.dot(&t);
             }
         }
 
-        // --- Predictive PLS on filtered X ---
+        let n_orth_defl = t_defl.len();
+
         let mut weights = Array2::<f64>::zeros((p, n_predictive));
         let mut loadings_x = Array2::<f64>::zeros((p, n_predictive));
         let mut loadings_y = Array2::<f64>::zeros((m, n_predictive));
 
         for a in 0..n_predictive {
             let (w, c) = if m == 1 {
-                let w = pls_weight_single(&xd, &yd.column(0).to_owned());
-                let t = dot_mv(&xd, &w);
+                let w = pls_weight_single(&x_sp, &x_mean, &t_defl, &p_defl, &yd.column(0).to_owned(), p);
+                let t = xeff_mul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &w, n);
                 let tt = t.dot(&t);
                 let c_val = yd.column(0).dot(&t) / tt;
                 let mut c = Array1::<f64>::zeros(1);
                 c[0] = c_val;
                 (w, c)
             } else {
-                pls_weight_multi(&xd, &yd, 500, 1e-10)
+                pls_weight_multi(&x_sp, &x_mean, &t_defl, &p_defl, &yd, n, p, 500, 1e-10)
             };
 
-            let t = dot_mv(&xd, &w);
+            let t = xeff_mul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &w, n);
             let tt = t.dot(&t);
-            let p_loading = dot_mtv(&xd, &t) / tt;
+            let p_loading = xeff_tmul_vec(&x_sp, &x_mean, &t_defl, &p_defl, &t, p) / tt;
 
-            // Store
             weights.column_mut(a).assign(&w);
             loadings_x.column_mut(a).assign(&p_loading);
             loadings_y.column_mut(a).assign(&c);
 
-            // Deflate X and Y
+            t_defl.push(t.clone());
+            p_defl.push(p_loading);
+
             for i in 0..n {
-                for j in 0..p {
-                    xd[[i, j]] -= t[i] * p_loading[j];
-                }
                 for j in 0..m {
                     yd[[i, j]] -= t[i] * c[j];
                 }
             }
         }
 
-        // Compute regression coefficients: B = W (P^T W)^{-1} C^T
+        t_defl.truncate(n_orth_defl);
+        p_defl.truncate(n_orth_defl);
+
         let coefficients = solve_coefficients(&weights, &loadings_x, &loadings_y);
 
         OplsModel {
@@ -284,34 +429,29 @@ impl OplsModel {
         }
     }
 
-    /// Predict Y for new sparse X data.
     pub fn predict(&self, x: &CsMatI<f64, usize>) -> Array2<f64> {
         let n = x.rows();
-        let p = x.cols();
+        let x_sp = sparse_row_normalize_pseudolog(x);
 
-        // Preprocess: row normalize, pseudolog
-        let mut xd = preprocess_x(x, n, p);
-
-        // Center using training means
-        for mut row in xd.rows_mut() {
-            row -= &self.x_mean;
-        }
-
-        // Remove orthogonal components
         let n_orth = self.weights_orth.ncols();
+        let mut t_defl: Vec<Array1<f64>> = Vec::new();
+        let mut p_defl: Vec<Array1<f64>> = Vec::new();
+
         for a in 0..n_orth {
-            let w_orth = self.weights_orth.column(a);
-            let p_orth = self.loadings_orth.column(a);
-            let t_orth = xd.dot(&w_orth);
-            for i in 0..n {
-                for j in 0..p {
-                    xd[[i, j]] -= t_orth[i] * p_orth[j];
-                }
-            }
+            let w_orth = self.weights_orth.column(a).to_owned();
+            let t_orth = xeff_mul_vec(&x_sp, &self.x_mean, &t_defl, &p_defl, &w_orth, n);
+            let p_orth = self.loadings_orth.column(a).to_owned();
+            t_defl.push(t_orth);
+            p_defl.push(p_orth);
         }
 
-        // Y_hat = X_filtered B + y_mean
-        let mut y_hat = xd.dot(&self.coefficients);
+        let m = self.coefficients.ncols();
+        let mut y_hat = Array2::<f64>::zeros((n, m));
+        for j in 0..m {
+            let b_col = self.coefficients.column(j).to_owned();
+            let col = xeff_mul_vec(&x_sp, &self.x_mean, &t_defl, &p_defl, &b_col, n);
+            y_hat.column_mut(j).assign(&col);
+        }
         for mut row in y_hat.rows_mut() {
             row += &self.y_mean;
         }
@@ -337,21 +477,51 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_row_normalization() {
-        let x = sparse_from_dense(&[&[2.0, 0.0, 8.0]], 1, 3);
-        let dense = preprocess_x(&x, 1, 3);
-        let expected = [
-            (0.2_f64 + 1.0).ln(),
-            0.0,
-            (0.8_f64 + 1.0).ln(),
-        ];
-        for j in 0..3 {
-            assert!(
-                (dense[[0, j]] - expected[j]).abs() < 1e-12,
-                "column {j}: got {} expected {}",
-                dense[[0, j]],
-                expected[j]
-            );
+    fn test_preprocess_preserves_sparsity() {
+        let x = sparse_from_dense(&[&[2.0, 0.0, 8.0, 0.0, 0.0]], 1, 5);
+        let x_pl = sparse_row_normalize_pseudolog(&x);
+        assert_eq!(x_pl.nnz(), 2);
+        let expected_0 = (0.2_f64 + 1.0).ln();
+        let expected_2 = (0.8_f64 + 1.0).ln();
+        let dense = x_pl.to_dense();
+        assert!((dense[[0, 0]] - expected_0).abs() < 1e-12);
+        assert_eq!(dense[[0, 1]], 0.0);
+        assert!((dense[[0, 2]] - expected_2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_implicit_xeff_matches_explicit() {
+        let x = sparse_from_dense(
+            &[
+                &[10.0, 0.0, 5.0],
+                &[0.0, 8.0, 2.0],
+                &[3.0, 3.0, 4.0],
+            ],
+            3, 3,
+        );
+        let x_sp = sparse_row_normalize_pseudolog(&x);
+        let mu = sparse_col_means(&x_sp, 3);
+
+        let t_k = Array1::from_vec(vec![1.0, -0.5, 0.3]);
+        let p_k = Array1::from_vec(vec![0.2, 0.8, -0.1]);
+        let v = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+
+        let result_impl = xeff_mul_vec(&x_sp, &mu, &[t_k.clone()], &[p_k.clone()], &v, 3);
+
+        let dense = x_sp.to_dense();
+        let mut xd = dense.mapv(|x| x);
+        for mut row in xd.rows_mut() {
+            row -= &mu;
+        }
+        for i in 0..3 {
+            for j in 0..3 {
+                xd[[i, j]] -= t_k[i] * p_k[j];
+            }
+        }
+        let result_expl = xd.dot(&v);
+
+        for i in 0..3 {
+            assert!((result_impl[i] - result_expl[i]).abs() < 1e-10);
         }
     }
 
@@ -366,8 +536,7 @@ mod tests {
                 &[5.0, 5.0, 4.0, 2.0],
                 &[3.0, 7.0, 2.0, 4.0],
             ],
-            6,
-            4,
+            6, 4,
         );
         let y = Array2::from_shape_vec((6, 1), vec![1.0, 1.2, 3.0, 3.5, 2.0, 2.5]).unwrap();
 
@@ -379,9 +548,7 @@ mod tests {
         for i in 0..6 {
             assert!(
                 y_hat[[i, 0]] > 0.0 && y_hat[[i, 0]] < 5.0,
-                "prediction {} out of range: {}",
-                i,
-                y_hat[[i, 0]]
+                "prediction {} out of range: {}", i, y_hat[[i, 0]]
             );
         }
     }
@@ -397,14 +564,12 @@ mod tests {
                 &[5.0, 5.0, 4.0, 2.0],
                 &[3.0, 7.0, 2.0, 4.0],
             ],
-            6,
-            4,
+            6, 4,
         );
         let y = Array2::from_shape_vec(
             (6, 2),
             vec![1.0, 5.0, 1.2, 4.8, 3.0, 2.0, 3.5, 1.5, 2.0, 3.0, 2.5, 2.5],
-        )
-        .unwrap();
+        ).unwrap();
 
         let model = OplsModel::fit(&x, &y, 2, 1);
         let y_hat = model.predict(&x);
@@ -421,8 +586,7 @@ mod tests {
                 &[5.0, 5.0, 3.0],
                 &[8.0, 1.0, 4.0],
             ],
-            4,
-            3,
+            4, 3,
         );
         let y = Array2::from_shape_vec((4, 1), vec![1.0, 3.0, 2.0, 1.5]).unwrap();
 
