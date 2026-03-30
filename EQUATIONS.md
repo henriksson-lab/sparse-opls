@@ -19,11 +19,51 @@ X_ij <- X_ij / r_i        for all j
 
 This converts raw counts to relative abundances (compositional normalization).
 
-After normalization, apply a pseudolog transform to X:
+After normalization, apply a variance-stabilizing transform (VST) to X.
+
+### Dispersion estimation (DESeq2-style)
+
+For negative-binomial count data, Var(K) = μ + α·μ², where α is the dispersion.
+
+1. Compute per-feature mean and variance from normalized X:
+   ```
+   μ_j = (1/n) Σ_i X_ij
+   σ²_j = (1/(n-1)) Σ_i (X_ij - μ_j)²
+   ```
+
+2. Estimate raw dispersions by method of moments:
+   ```
+   α_j^raw = (σ²_j - μ_j) / μ_j²
+   ```
+
+3. Fit a mean-dispersion trend (parametric):
+   ```
+   α(μ) = a_1 / μ + a_0
+   ```
+   Fit by linear regression of α_j^raw on 1/μ_j, using features with
+   α_j^raw > 0 and μ_j > threshold.
+
+4. Final dispersion: use the trend value for each feature:
+   ```
+   α_j = a_1 / μ_j + a_0
+   ```
+   Clamp to a minimum of 1e-8 to avoid degenerate transforms.
+
+### Variance-stabilizing transform
+
+The NB variance-stabilizing transform integrates 1/√Var(μ):
 
 ```
-X_ij <- log(X_ij + 1)
+∫ dμ / √(μ + α·μ²) = (2/√α) · asinh(√(α·μ))
 ```
+
+Apply per feature using its dispersion:
+
+```
+X_ij <- (2/√α_j) · asinh(√(α_j · X_ij))
+```
+
+Note: f(0) = 0, so sparsity is preserved.
 
 Then center both matrices by subtracting column means:
 
@@ -130,7 +170,8 @@ Y_hat = X_filtered B + y_mean
 
 | Symbol    | Dimension         | Description                          |
 |-----------|-------------------|--------------------------------------|
-| x_mean    | 1 x p             | Column means of normalized X         |
+| α         | 1 x p             | Per-feature NB dispersions           |
+| x_mean    | 1 x p             | Column means of VST-transformed X    |
 | y_mean    | 1 x m             | Column means of Y                    |
 | W         | p x A_pred        | Predictive weight vectors            |
 | P         | p x A_pred        | Predictive X-loadings                |

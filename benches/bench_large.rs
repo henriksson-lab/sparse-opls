@@ -36,7 +36,7 @@ fn bench_config(n: usize, p: usize, density: f64, n_pred: usize, n_orth: usize) 
     // Run 3 times, take best
     let mut best_fit = f64::MAX;
     let mut best_predict = f64::MAX;
-    for _ in 0..3 {
+    for run in 0..3 {
         let start = Instant::now();
         let model = OplsModel::fit(&x, &y, n_pred, n_orth);
         let fit_time = start.elapsed().as_secs_f64();
@@ -46,16 +46,23 @@ fn bench_config(n: usize, p: usize, density: f64, n_pred: usize, n_orth: usize) 
         let _y_hat = model.predict(&x);
         let predict_time = start.elapsed().as_secs_f64();
         best_predict = best_predict.min(predict_time);
+
+        if run == 0 {
+            // Print dispersion stats on first run
+            let d = &model.dispersions;
+            let d_slice = d.as_slice().unwrap();
+            let mean_d: f64 = d_slice.iter().sum::<f64>() / d_slice.len() as f64;
+            let min_d = d_slice.iter().cloned().fold(f64::MAX, f64::min);
+            let max_d = d_slice.iter().cloned().fold(f64::MIN, f64::max);
+            println!("  dispersions: mean={mean_d:.4}, min={min_d:.6}, max={max_d:.4}");
+        }
     }
     println!("  fit:     {best_fit:.3}s");
     println!("  predict: {best_predict:.3}s");
 }
 
 fn main() {
-    #[cfg(feature = "parallel")]
-    println!("Mode: PARALLEL (rayon, {} threads)", rayon::current_num_threads());
-    #[cfg(not(feature = "parallel"))]
-    println!("Mode: SERIAL");
+    println!("Benchmark: sparse OPLS with DESeq2-style VST");
 
     println!();
     println!("--- 10k samples x 20k features, 1% density ---");
