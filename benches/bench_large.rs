@@ -75,4 +75,8 @@ fn main() {
     println!();
     println!("--- 50k samples x 20k features, 1% density ---");
     bench_config(50_000, 20_000, 0.01, 2, 2);
+
+    println!();
+    println!("--- 200k samples x 20k features, 5% density ---");
+    bench_config(200_000, 20_000, 0.05, 2, 2);
 }

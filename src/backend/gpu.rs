@@ -20,19 +20,21 @@ pub struct GpuBackend {
     _d_row_offsets: CudaSlice<i32>,
     n: usize,
     p: usize,
-    // State: mean and deflation vectors on device
     d_mu: Option<CudaSlice<f64>>,
     d_t_defl: Vec<CudaSlice<f64>>,
     d_p_defl: Vec<CudaSlice<f64>>,
     d_ones_n: CudaSlice<f64>,
-    // Scratch buffers
+    /// Device constant [-1.0] for negating scalars via dscal
+    d_neg_one: CudaSlice<f64>,
     scratch: RefCell<ScratchBuffers>,
 }
 
 struct ScratchBuffers {
-    d_x: CudaSlice<f64>,   // max(n,p)
-    d_y: CudaSlice<f64>,   // max(n,p)
-    d_w: CudaSlice<f64>,   // p (for nipals_wt fused op)
+    d_x: CudaSlice<f64>,
+    d_y: CudaSlice<f64>,
+    d_w: CudaSlice<f64>,
+    /// Device scalar buffer for dot product results (1 element)
+    d_scalar: CudaSlice<f64>,
     workspace_fwd: CudaSlice<u8>,
     workspace_trans: CudaSlice<u8>,
 }
@@ -56,7 +58,6 @@ impl GpuBackend {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
 
-        // Convert indices
         let indptr_raw = x_sp.indptr();
         let indptr = indptr_raw.as_slice().ok_or("non-contiguous indptr")?;
         let row_offsets_i32: Vec<i32> = indptr.iter().map(|&x| x as i32).collect();
@@ -87,16 +88,14 @@ impl GpuBackend {
             descr.assume_init()
         };
 
-        // cuBLAS
+        // cuBLAS — DEVICE pointer mode: scalars stay on GPU
         let cublas_handle = cudarc::cublas::result::create_handle()
             .map_err(|e| format!("cublasCreate: {:?}", e))?;
         unsafe {
-            // Set pointer mode to HOST (scalars passed as host pointers)
             blas::cublasSetPointerMode_v2(
                 cublas_handle,
-                blas::cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST,
+                blas::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
             ).result().map_err(|e| format!("cublasSetPointerMode: {:?}", e))?;
-            // Bind cuBLAS to same stream
             blas::cublasSetStream_v2(
                 cublas_handle,
                 stream.cu_stream() as _,
@@ -108,12 +107,13 @@ impl GpuBackend {
         let mut d_x: CudaSlice<f64> = stream.alloc_zeros(max_dim)?;
         let mut d_y: CudaSlice<f64> = stream.alloc_zeros(max_dim)?;
         let d_w: CudaSlice<f64> = stream.alloc_zeros(p)?;
+        let d_scalar: CudaSlice<f64> = stream.alloc_zeros(1)?;
 
-        // Ones vectors for scalar-broadcast
-        let ones_n = vec![1.0_f64; n];
-        let d_ones_n = stream.clone_htod(&ones_n)?;
+        // Device constants
+        let d_ones_n = stream.clone_htod(&vec![1.0_f64; n])?;
+        let d_neg_one = stream.clone_htod(&[-1.0_f64])?;
 
-        // Workspace sizes
+        // Workspace sizes (cuSPARSE takes host pointers for alpha/beta regardless)
         let alpha: f64 = 1.0;
         let beta: f64 = 0.0;
 
@@ -142,20 +142,13 @@ impl GpuBackend {
         let workspace_trans: CudaSlice<u8> = stream.alloc_zeros(workspace_trans_size.max(1))?;
 
         Ok(GpuBackend {
-            stream,
-            cusparse_handle,
-            cublas_handle,
-            mat_descr,
-            _d_values: d_values,
-            _d_col_indices: d_col_indices,
-            _d_row_offsets: d_row_offsets,
+            stream, cusparse_handle, cublas_handle, mat_descr,
+            _d_values: d_values, _d_col_indices: d_col_indices, _d_row_offsets: d_row_offsets,
             n, p,
-            d_mu: None,
-            d_t_defl: Vec::new(),
-            d_p_defl: Vec::new(),
-            d_ones_n,
+            d_mu: None, d_t_defl: Vec::new(), d_p_defl: Vec::new(),
+            d_ones_n, d_neg_one,
             scratch: RefCell::new(ScratchBuffers {
-                d_x, d_y, d_w, workspace_fwd, workspace_trans,
+                d_x, d_y, d_w, d_scalar, workspace_fwd, workspace_trans,
             }),
         })
     }
@@ -193,16 +186,14 @@ impl GpuBackend {
         }
     }
 
-    /// Run cuSPARSE SpMV: d_out = op(A) * d_in. Both must already be on device.
-    /// d_in_ptr points to input data, d_out_ptr to output (will be overwritten).
+    /// Run cuSPARSE SpMV. Note: cuSPARSE always uses host pointers for alpha/beta
+    /// regardless of cuBLAS pointer mode.
     fn run_spmv(
         &self,
         op: sp::cusparseOperation_t,
-        d_in_ptr: cudarc::driver::sys::CUdeviceptr,
-        d_out_ptr: cudarc::driver::sys::CUdeviceptr,
-        input_len: usize,
-        output_len: usize,
-        ws_ptr: cudarc::driver::sys::CUdeviceptr,
+        d_in_ptr: u64, d_out_ptr: u64,
+        input_len: usize, output_len: usize,
+        ws_ptr: u64,
     ) {
         let alpha: f64 = 1.0;
         let beta: f64 = 0.0;
@@ -231,92 +222,120 @@ impl GpuBackend {
         }
     }
 
-    /// cuBLAS dot product: returns x·y as host scalar
-    fn ddot(&self, x_ptr: u64, y_ptr: u64, len: usize) -> f64 {
-        let mut result: f64 = 0.0;
+    // ── cuBLAS helpers (DEVICE pointer mode) ───────────────────────────────
+
+    /// ddot → d_scalar (device). No host sync.
+    fn ddot_to_device(&self, x_ptr: u64, y_ptr: u64, len: usize, scalar_ptr: u64) {
         unsafe {
             blas::cublasDdot_v2(
-                self.cublas_handle,
-                len as i32,
+                self.cublas_handle, len as i32,
                 x_ptr as *const f64, 1,
                 y_ptr as *const f64, 1,
-                &mut result as *mut f64,
+                scalar_ptr as *mut f64,
             ).result().expect("cublasDdot");
         }
-        result
     }
 
-    /// cuBLAS axpy: y += alpha * x
-    fn daxpy(&self, alpha: f64, x_ptr: u64, y_ptr: u64, len: usize) {
+    /// Negate d_scalar in-place: d_scalar *= -1. Uses d_neg_one device constant.
+    fn negate_scalar(&self, scalar_ptr: u64) {
+        let neg_one_ptr = raw_ptr(&self.d_neg_one, &self.stream);
+        unsafe {
+            blas::cublasDscal_v2(
+                self.cublas_handle, 1,
+                neg_one_ptr as *const f64,
+                scalar_ptr as *mut f64, 1,
+            ).result().expect("cublasDscal negate");
+        }
+    }
+
+    /// daxpy with alpha from device: y += d_scalar * x. No host sync.
+    fn daxpy_device(&self, scalar_ptr: u64, x_ptr: u64, y_ptr: u64, len: usize) {
         unsafe {
             blas::cublasDaxpy_v2(
-                self.cublas_handle,
-                len as i32,
-                &alpha as *const f64,
+                self.cublas_handle, len as i32,
+                scalar_ptr as *const f64,
                 x_ptr as *const f64, 1,
                 y_ptr as *mut f64, 1,
             ).result().expect("cublasDaxpy");
         }
     }
 
-    /// cuBLAS nrm2: returns ||x||
-    fn dnrm2(&self, x_ptr: u64, len: usize) -> f64 {
-        let mut result: f64 = 0.0;
+    /// dnrm2 → d_scalar (device). No host sync.
+    fn dnrm2_to_device(&self, x_ptr: u64, len: usize, scalar_ptr: u64) {
         unsafe {
             blas::cublasDnrm2_v2(
-                self.cublas_handle,
-                len as i32,
+                self.cublas_handle, len as i32,
                 x_ptr as *const f64, 1,
-                &mut result as *mut f64,
+                scalar_ptr as *mut f64,
             ).result().expect("cublasDnrm2");
         }
-        result
     }
 
-    /// cuBLAS scal: x *= alpha
-    fn dscal(&self, alpha: f64, x_ptr: u64, len: usize) {
+    /// Download a single f64 from device scalar buffer to host.
+    fn download_scalar(&self, d_scalar: &CudaSlice<f64>) -> f64 {
+        let mut val = [0.0_f64];
+        self.stream.memcpy_dtoh(d_scalar, &mut val).expect("dtoh scalar");
+        self.stream.synchronize().expect("sync");
+        val[0]
+    }
+
+    /// dscal with alpha from host (temporarily switch to host pointer mode).
+    fn dscal_host(&self, alpha: f64, x_ptr: u64, len: usize) {
         unsafe {
-            blas::cublasDscal_v2(
+            blas::cublasSetPointerMode_v2(
                 self.cublas_handle,
-                len as i32,
+                blas::cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST,
+            ).result().expect("set host mode");
+            blas::cublasDscal_v2(
+                self.cublas_handle, len as i32,
                 &alpha as *const f64,
                 x_ptr as *mut f64, 1,
             ).result().expect("cublasDscal");
+            blas::cublasSetPointerMode_v2(
+                self.cublas_handle,
+                blas::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
+            ).result().expect("restore device mode");
         }
     }
 
-    /// Apply forward corrections on GPU: result -= (mu·v)*1 - Σ(p_k·v)*t_k
-    /// result_ptr points to d_y (size n), v_ptr points to d_x (size p)
-    fn apply_forward_corrections_gpu(&self, result_ptr: u64, v_ptr: u64) {
+    // ── Correction helpers ─────────────────────────────────────────────────
+
+    /// ddot → negate → daxpy, all on device. No sync.
+    fn dot_negate_axpy(
+        &self, dot_x: u64, dot_y: u64, dot_len: usize,
+        axpy_src: u64, axpy_dst: u64, axpy_len: usize,
+        scalar_ptr: u64,
+    ) {
+        self.ddot_to_device(dot_x, dot_y, dot_len, scalar_ptr);
+        self.negate_scalar(scalar_ptr);
+        self.daxpy_device(scalar_ptr, axpy_src, axpy_dst, axpy_len);
+    }
+
+    /// Apply forward corrections: result -= (mu·v)*1 - Σ(p_k·v)*t_k
+    fn apply_forward_corrections_gpu(&self, result_ptr: u64, v_ptr: u64, scalar_ptr: u64) {
         if let Some(d_mu) = &self.d_mu {
             let mu_ptr = raw_ptr(d_mu, &self.stream);
-            let mu_dot_v = self.ddot(mu_ptr, v_ptr, self.p);
-            // result -= mu_dot_v * ones_n
             let ones_ptr = raw_ptr(&self.d_ones_n, &self.stream);
-            self.daxpy(-mu_dot_v, ones_ptr, result_ptr, self.n);
+            self.dot_negate_axpy(mu_ptr, v_ptr, self.p, ones_ptr, result_ptr, self.n, scalar_ptr);
         }
         for (d_t, d_p) in self.d_t_defl.iter().zip(self.d_p_defl.iter()) {
             let p_ptr = raw_ptr(d_p, &self.stream);
-            let coeff = self.ddot(p_ptr, v_ptr, self.p);
             let t_ptr = raw_ptr(d_t, &self.stream);
-            self.daxpy(-coeff, t_ptr, result_ptr, self.n);
+            self.dot_negate_axpy(p_ptr, v_ptr, self.p, t_ptr, result_ptr, self.n, scalar_ptr);
         }
     }
 
-    /// Apply transpose corrections on GPU: result -= sum(v)*mu - Σ(t_k·v)*p_k
-    /// result_ptr points to d_y (size p), v_ptr points to d_x (size n)
-    fn apply_transpose_corrections_gpu(&self, result_ptr: u64, v_ptr: u64) {
+    /// Apply transpose corrections: result -= sum(v)*mu - Σ(t_k·v)*p_k
+    fn apply_transpose_corrections_gpu(&self, result_ptr: u64, v_ptr: u64, scalar_ptr: u64) {
         if let Some(d_mu) = &self.d_mu {
             let ones_ptr = raw_ptr(&self.d_ones_n, &self.stream);
-            let sum_v = self.ddot(ones_ptr, v_ptr, self.n);
             let mu_ptr = raw_ptr(d_mu, &self.stream);
-            self.daxpy(-sum_v, mu_ptr, result_ptr, self.p);
+            self.dot_negate_axpy(ones_ptr, v_ptr, self.n, mu_ptr, result_ptr, self.p, scalar_ptr);
         }
         for (d_t, d_p) in self.d_t_defl.iter().zip(self.d_p_defl.iter()) {
             let t_ptr = raw_ptr(d_t, &self.stream);
-            let coeff = self.ddot(t_ptr, v_ptr, self.n);
             let p_ptr = raw_ptr(d_p, &self.stream);
-            self.daxpy(-coeff, p_ptr, result_ptr, self.p);
+            self.dot_negate_axpy(t_ptr, v_ptr, self.n, p_ptr, result_ptr, self.p, scalar_ptr);
         }
     }
 
@@ -328,15 +347,12 @@ impl GpuBackend {
 
 impl OplsBackend for GpuBackend {
     fn set_mean(&mut self, mu: Array1<f64>) {
-        let d_mu = self.stream.clone_htod(mu.as_slice().unwrap()).expect("htod mu");
-        self.d_mu = Some(d_mu);
+        self.d_mu = Some(self.stream.clone_htod(mu.as_slice().unwrap()).expect("htod mu"));
     }
 
     fn push_deflation(&mut self, t: Array1<f64>, p: Array1<f64>) {
-        let d_t = self.stream.clone_htod(t.as_slice().unwrap()).expect("htod t");
-        let d_p = self.stream.clone_htod(p.as_slice().unwrap()).expect("htod p");
-        self.d_t_defl.push(d_t);
-        self.d_p_defl.push(d_p);
+        self.d_t_defl.push(self.stream.clone_htod(t.as_slice().unwrap()).expect("htod t"));
+        self.d_p_defl.push(self.stream.clone_htod(p.as_slice().unwrap()).expect("htod p"));
     }
 
     fn truncate_deflation(&mut self, keep: usize) {
@@ -350,23 +366,16 @@ impl OplsBackend for GpuBackend {
 
     fn xeff_forward(&self, v: &Array1<f64>, n: usize) -> Array1<f64> {
         let mut scratch = self.scratch.borrow_mut();
-        // Upload v (size p) to d_x
         self.stream.memcpy_htod(v.as_slice().unwrap(), &mut scratch.d_x).expect("htod v");
         self.stream.memset_zeros(&mut scratch.d_y).expect("memset");
 
         let x_ptr = raw_ptr(&scratch.d_x, &self.stream);
         let y_ptr = raw_ptr_mut(&mut scratch.d_y, &self.stream);
         let ws_ptr = raw_ptr_mut(&mut scratch.workspace_fwd, &self.stream);
+        let sc_ptr = raw_ptr_mut(&mut scratch.d_scalar, &self.stream);
 
-        self.run_spmv(
-            sp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE,
-            x_ptr, y_ptr, self.p, n, ws_ptr,
-        );
-
-        // Dense corrections on GPU
-        self.apply_forward_corrections_gpu(y_ptr, x_ptr);
-
-        // Download result
+        self.run_spmv(sp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE, x_ptr, y_ptr, self.p, n, ws_ptr);
+        self.apply_forward_corrections_gpu(y_ptr, x_ptr, sc_ptr);
         self.download(&scratch.d_y, n)
     }
 
@@ -378,14 +387,10 @@ impl OplsBackend for GpuBackend {
         let x_ptr = raw_ptr(&scratch.d_x, &self.stream);
         let y_ptr = raw_ptr_mut(&mut scratch.d_y, &self.stream);
         let ws_ptr = raw_ptr_mut(&mut scratch.workspace_trans, &self.stream);
+        let sc_ptr = raw_ptr_mut(&mut scratch.d_scalar, &self.stream);
 
-        self.run_spmv(
-            sp::cusparseOperation_t::CUSPARSE_OPERATION_TRANSPOSE,
-            x_ptr, y_ptr, self.n, p, ws_ptr,
-        );
-
-        self.apply_transpose_corrections_gpu(y_ptr, x_ptr);
-
+        self.run_spmv(sp::cusparseOperation_t::CUSPARSE_OPERATION_TRANSPOSE, x_ptr, y_ptr, self.n, p, ws_ptr);
+        self.apply_transpose_corrections_gpu(y_ptr, x_ptr, sc_ptr);
         self.download(&scratch.d_y, p)
     }
 
@@ -393,46 +398,41 @@ impl OplsBackend for GpuBackend {
         let mut scratch = self.scratch.borrow_mut();
 
         // Step 1: w = normalize(X_eff^T * u)
-        // Upload u (size n) to d_x
         self.stream.memcpy_htod(u.as_slice().unwrap(), &mut scratch.d_x).expect("htod u");
-        // d_w = X_sp^T * d_x (transpose SpMV)
         self.stream.memset_zeros(&mut scratch.d_w).expect("memset");
+
         let u_ptr = raw_ptr(&scratch.d_x, &self.stream);
         let w_ptr = raw_ptr_mut(&mut scratch.d_w, &self.stream);
         let ws_ptr = raw_ptr_mut(&mut scratch.workspace_trans, &self.stream);
+        let sc_ptr = raw_ptr_mut(&mut scratch.d_scalar, &self.stream);
 
-        self.run_spmv(
-            sp::cusparseOperation_t::CUSPARSE_OPERATION_TRANSPOSE,
-            u_ptr, w_ptr, self.n, p, ws_ptr,
-        );
-        // Dense corrections for transpose on d_w (input was d_x = u)
-        self.apply_transpose_corrections_gpu(w_ptr, u_ptr);
-        // Normalize w on device
-        let nrm = self.dnrm2(w_ptr, p);
+        self.run_spmv(sp::cusparseOperation_t::CUSPARSE_OPERATION_TRANSPOSE, u_ptr, w_ptr, self.n, p, ws_ptr);
+        self.apply_transpose_corrections_gpu(w_ptr, u_ptr, sc_ptr);
+
+        // Normalize w: nrm2 → device scalar → download 1 f64 → dscal with host alpha
+        self.dnrm2_to_device(w_ptr, p, sc_ptr);
+        let nrm = self.download_scalar(&scratch.d_scalar); // 1 sync
         if nrm > 0.0 {
-            self.dscal(1.0 / nrm, w_ptr, p);
+            self.dscal_host(1.0 / nrm, w_ptr, p);
         }
 
-        // Step 2: t = X_eff * w (w is already on device in d_w, no upload needed!)
+        // Step 2: t = X_eff * w (w already on device — no upload)
         self.stream.memset_zeros(&mut scratch.d_y).expect("memset");
-        let w_ptr = raw_ptr(&scratch.d_w, &self.stream); // re-get as immutable
+        let w_ptr = raw_ptr(&scratch.d_w, &self.stream);
         let t_ptr = raw_ptr_mut(&mut scratch.d_y, &self.stream);
         let ws_ptr = raw_ptr_mut(&mut scratch.workspace_fwd, &self.stream);
+        let sc_ptr = raw_ptr_mut(&mut scratch.d_scalar, &self.stream);
 
-        self.run_spmv(
-            sp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE,
-            w_ptr, t_ptr, self.p, n, ws_ptr,
-        );
-        // Dense corrections for forward (input was d_w)
-        self.apply_forward_corrections_gpu(t_ptr, w_ptr);
+        self.run_spmv(sp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE, w_ptr, t_ptr, self.p, n, ws_ptr);
+        self.apply_forward_corrections_gpu(t_ptr, w_ptr, sc_ptr);
 
-        // t·t on device
-        let tt = self.ddot(t_ptr, t_ptr, n);
+        // t·t → device scalar → download 1 f64
+        self.ddot_to_device(t_ptr, t_ptr, n, sc_ptr);
+        let tt = self.download_scalar(&scratch.d_scalar); // 1 sync
 
         // Download w and t
         let w = self.download(&scratch.d_w, p);
         let t = self.download(&scratch.d_y, n);
-
         (w, t, tt)
     }
 }
