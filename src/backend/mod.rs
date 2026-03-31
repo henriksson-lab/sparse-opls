@@ -30,10 +30,24 @@ pub trait OplsBackend {
     fn nipals_wt(&self, u: &Array1<f64>, n: usize, p: usize) -> (Array1<f64>, Array1<f64>, f64);
 }
 
+/// Backend selection for fit/predict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// Automatically select GPU if available, otherwise CPU.
+    Auto,
+    /// Force CPU backend.
+    Cpu,
+}
+
 /// Create the best available backend for the given sparse matrix.
 pub fn create_backend(x_sp: &sprs::CsMat<f64>) -> Box<dyn OplsBackend> {
+    create_backend_with(x_sp, Backend::Auto)
+}
+
+/// Create a backend with explicit selection.
+pub fn create_backend_with(x_sp: &sprs::CsMat<f64>, choice: Backend) -> Box<dyn OplsBackend> {
     #[cfg(feature = "cuda")]
-    {
+    if choice != Backend::Cpu {
         match gpu::GpuBackend::try_new(x_sp) {
             Ok(b) => return Box::new(b),
             Err(e) => {
@@ -41,5 +55,7 @@ pub fn create_backend(x_sp: &sprs::CsMat<f64>) -> Box<dyn OplsBackend> {
             }
         }
     }
+    #[cfg(not(feature = "cuda"))]
+    let _ = choice;
     Box::new(cpu::CpuBackend::new(x_sp))
 }

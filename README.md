@@ -66,11 +66,12 @@ All benchmarks: 2 predictive + 2 orthogonal components, best of 3 runs.
 
 ### Multi-Y (m=5, exercises NIPALS inner loop)
 
-| Config | nnz | CPU fit | GPU fit | Speedup |
+| Config | nnz | CPU total | GPU total | Speedup |
 |---|---|---|---|---|
-| 10k x 20k, 1% | 2M | 18.0s | 1.66s | **10.8x** |
-| 10k x 20k, 5% | 10M | 79.2s | 4.00s | **19.8x** |
-| 50k x 20k, 1% | 10M | 72.8s | 5.33s | **13.7x** |
+| 10k x 20k, 1% | 2M | 16.39s | 2.39s | **6.85x** |
+| 10k x 20k, 5% | 10M | 59.90s | 5.21s | **11.50x** |
+| 50k x 20k, 1% | 10M | 100.47s | 6.58s | **15.27x** |
+| 500k x 20k, 5% | 500M | — | 344.0s | — |
 
 GPU acceleration is most effective with multiple response variables (m > 1), where the
 NIPALS iterative loop runs entirely on GPU with device-pointer mode cuBLAS, avoiding

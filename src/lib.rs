@@ -2,6 +2,7 @@ use ndarray::{Array1, Array2, Axis, s};
 use sprs::CsMatI;
 
 pub mod backend;
+pub use backend::Backend;
 use backend::OplsBackend;
 
 /// Fitted OPLS model containing all components needed for prediction.
@@ -233,13 +234,23 @@ impl OplsModel {
         n_predictive: usize,
         n_orthogonal: usize,
     ) -> Self {
+        Self::fit_with(x, y, n_predictive, n_orthogonal, Backend::Auto)
+    }
+
+    pub fn fit_with(
+        x: &CsMatI<f64, usize>,
+        y: &Array2<f64>,
+        n_predictive: usize,
+        n_orthogonal: usize,
+        backend_choice: Backend,
+    ) -> Self {
         let n = y.nrows();
         let p = x.cols();
         let m = y.ncols();
 
         let (x_sp, dispersions) = preprocess_fit(x, n);
         let x_mean = sparse_col_means(&x_sp, n);
-        let mut be = backend::create_backend(&x_sp);
+        let mut be = backend::create_backend_with(&x_sp, backend_choice);
         be.set_mean(x_mean.clone());
 
         let mut yd = y.clone();
@@ -324,9 +335,13 @@ impl OplsModel {
     }
 
     pub fn predict(&self, x: &CsMatI<f64, usize>) -> Array2<f64> {
+        self.predict_with(x, Backend::Auto)
+    }
+
+    pub fn predict_with(&self, x: &CsMatI<f64, usize>, backend_choice: Backend) -> Array2<f64> {
         let n = x.rows();
         let x_sp = preprocess_predict(x, &self.dispersions);
-        let mut be = backend::create_backend(&x_sp);
+        let mut be = backend::create_backend_with(&x_sp, backend_choice);
         be.set_mean(self.x_mean.clone());
 
         let n_orth = self.weights_orth.ncols();
